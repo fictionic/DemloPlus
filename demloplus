@@ -1,0 +1,681 @@
+#!/bin/python
+
+# TODO:
+# - artists that are partially symlinked, partially demloed
+# - more configurability for paths, library structure
+
+import sys, os, os.path, subprocess, argparse
+from enum import Enum
+from mpd import MPDClient
+
+HI_RES_LIBRARY_BASE_PATH = '/home/dylan/audio/library/hi-res/'
+LO_RES_LIBRARY_BASE_PATH = '/home/dylan/audio/library/lo-res/'
+SDCARD_LIBRARY_BASE_PATH = '/media/sdcard/'
+LIBRARY_DEMLO_PATH = 'music/non-torrents/'
+LIBRARY_SYMLINK_PATH = 'music/torrents/'
+SDCARD_MOUNT_PATH = '/media/sdcard/'
+TORRENT_DIRECTORY_PATH = '/home/dylan/torrents/'
+MPD_PORT = 6600
+
+def print_action(string):
+    for line in str(string).split('\n'):
+        print(" >> " + line)
+
+def is_prefix(st1, st2):
+    return len(st2) >= len(st1) and st2[:len(st1)] == st1
+
+def ask_yn(question):
+    return input(question) in ['', 'y']
+
+class MpdQueryException(Exception):
+    pass
+
+class NoResultsFoundException(MpdQueryException):
+    def __str__(self):
+        return "Error: no results found in MPD database"
+
+class MultipleResultsFoundException(MpdQueryException):
+    def __init__(self, duplicate_info):
+        self.message = "Error: non-unique results found in MPD database"
+        self.message += '\n\t' + duplicate_info['tag'] + ': ' + str(duplicate_info['values'])
+    def __str__(self):
+        return self.message
+
+def apply_lo_res_pathsubs(string):
+    lua_code = """local s = "%s"
+    require "02-lo-res"
+    for bad, good in pairs(pathsubs) do
+        s = s:gsub(bad, good)
+    end
+    print(s)""" % string
+    lua_cmd = ['/usr/bin/lua', '-e', lua_code]
+    with subprocess.Popen(lua_cmd, cwd="/home/dylan/.config/demlo/scripts", stdout=subprocess.PIPE) as proc:
+        out = proc.stdout.read().decode('UTF-8').strip()
+    return out
+
+# TODO: redesign this class.
+# there's a bit of redundancy I think.
+# also, more importantly, copying from hi-res to lo-res should change file extensions based on 30-path.lua
+class Paths:
+    def __init__(self):
+        self.hi_res = None
+        self.lo_res = None
+        self.sdcard = None
+    def init_hi_res(self):
+        self.hi_res = self.SubPaths(HI_RES_LIBRARY_BASE_PATH)
+    def init_lo_res(self):
+        self.lo_res = self.SubPaths(LO_RES_LIBRARY_BASE_PATH)
+    def init_sdcard(self):
+        self.sdcard = self.SubPaths(SDCARD_LIBRARY_BASE_PATH)
+    def __iter__(self):
+        ret = []
+        if self.hi_res:
+            ret.append(self.hi_res)
+        if self.lo_res:
+            ret.append(self.lo_res)
+        if self.sdcard:
+            ret.append(self.sdcard)
+        return ret.__iter__()
+    def fill_in_lo_res(self, source):
+        self.init_lo_res()
+        if source.demlo:
+            source_components = source.demlo
+        elif source.symlink:
+            source_components = source.symlink
+        else:
+            return
+        self.lo_res.init_demlo()
+        self.lo_res.demlo.copy_from(source_components, source is self.hi_res)
+        self.lo_res.init_symlink()
+        self.lo_res.symlink.copy_from(source_components, source is self.hi_res)
+    def fill_in_sdcard(self, source):
+        self.init_sdcard()
+        if source.demlo:
+            self.sdcard.init_demlo()
+            self.sdcard.demlo.copy_from(source.demlo, source is self.hi_res)
+        if source.symlink:
+            self.sdcard.init_symlink()
+            self.sdcard.symlink.copy_from(source.symlink, source is self.hi_res)
+
+    class SubPaths:
+        def __init__(self, library_base_path):
+            self.library_base_path = library_base_path
+            self.demlo = None
+            self.symlink = None
+        def init_demlo(self):
+            self.demlo = self.PathComponents(self.library_base_path + LIBRARY_DEMLO_PATH)
+        def init_symlink(self):
+            self.symlink = self.PathComponents(self.library_base_path + LIBRARY_SYMLINK_PATH)
+        def __iter__(self):
+            return [self.demlo, self.symlink].__iter__()
+
+        class PathComponents:
+            def __init__(self, base):
+                self.artist = None
+                self.album = None
+                self.title = None
+                self.base = base
+            def copy_from(self, other_path_components, apply_pathsubs):
+                if apply_pathsubs:
+                    self.artist = apply_lo_res_pathsubs(other_path_components.artist)
+                    if other_path_components.album:
+                        self.album = apply_lo_res_pathsubs(other_path_components.album)
+                    else:
+                        self.album = None
+                    if other_path_components.title:
+                        self.title = apply_lo_res_pathsubs(other_path_components.title)
+                    else:
+                        self.title = None
+                else:
+                    self.artist = other_path_components.artist
+                    self.album = other_path_components.album
+                    self.title = other_path_components.title
+            def __str__(self):
+                if self.artist:
+                    out = self.base + self.artist
+                    if self.album:
+                        out += '/' + self.album
+                        if self.title:
+                            out += '/' + self.title
+                    return out
+                    
+class TargetType(Enum):
+    ARTIST = 1
+    ALBUM = 2
+    TRACK = 3
+    UNKNOWN_DIRECTORY = 4
+    def __str__(self):
+        if self is TargetType.ARTIST:
+            return 'artist'
+        elif self is TargetType.ALBUM:
+            return 'album'
+        elif self is TargetType.TRACK:
+            return 'track'
+        else:
+            return 'directory'
+
+# class to contain information about a given query
+class Info:
+    def __init__(self):
+        self.target = None
+        self.target_type = None
+        self.status = None
+        self.paths = None
+
+    def print_self(self):
+        print('TARGET:')
+        print_action(self.target)
+        print_action('Type: ' + str(self.target_type))
+        print('STATUS:')
+        # is it in hi-res?
+        if self.status.DEMLOED_INTO_HI_RES or self.status.SYMLINKED_INTO_HI_RES:
+            if self.status.DEMLOED_INTO_HI_RES:
+                print_action('Demloed into hi-res library')
+                print('\t' + self.paths.hi_res.demlo.__str__())
+            if self.status.SYMLINKED_INTO_HI_RES:
+                print_action('Symlinked into hi-res library')
+                print('\t' + self.paths.hi_res.symlink.__str__())
+        else:
+            print_action('NOT in hi-res library')
+        # is it in lo-res?
+        if self.status.DEMLOED_INTO_LO_RES or self.status.SYMLINKED_INTO_LO_RES:
+            if self.status.DEMLOED_INTO_HI_RES:
+                if self.status.DEMLOED_INTO_LO_RES:
+                    print_action('Demloed into lo-res library')
+                else:
+                    print_action('NOT demloed into lo-res library')
+                print('\t' + self.paths.lo_res.demlo.__str__())
+            if self.status.SYMLINKED_INTO_HI_RES:
+                if self.status.SYMLINKED_INTO_LO_RES:
+                    print_action('Symlinked into lo-res library')
+                else:
+                    print_action('NOT symlinked into lo-res library')
+                print('\t' + self.paths.lo_res.symlink.__str__())
+        else:
+            print_action('NOT in lo-res library')
+        # is it on sdcard?
+        if os.path.ismount(SDCARD_MOUNT_PATH):
+            if self.status.DEMLOED_ONTO_SDCARD or self.status.SYMLINKED_ONTO_SDCARD:
+                if self.status.DEMLOED_INTO_LO_RES:
+                    if self.status.DEMLOED_ONTO_SDCARD:
+                        print_action('Demloed onto sdcard')
+                    else:
+                        print_action('NOT demloed onto sdcard')
+                    print('\t' + self.paths.sdcard.demlo.__str__())
+                if self.status.SYMLINKED_INTO_LO_RES:
+                    if self.status.SYMLINKED_ONTO_SDCARD:
+                        print_action('Symlinked onto sdcard')
+                    else:
+                        print_action('NOT symlinked onto sdcard')
+                    print('\t' + self.paths.sdcard.symlink.__str__())
+            else:
+                print_action('NOT on sdcard')
+        else:
+            print_action('(not checking sdcard)')
+
+
+class Status:
+    def __init__(self):
+        self.DEMLOED_INTO_HI_RES = False
+        self.SYMLINKED_INTO_HI_RES = False
+        self.DEMLOED_INTO_LO_RES = False
+        self.SYMLINKED_INTO_LO_RES = False
+        self.DEMLOED_ONTO_SDCARD = False
+        self.SYMLINKED_ONTO_SDCARD = False
+
+class DemloCommand:
+    def __init__(self):
+        self.args = DemloArgs()
+        self.input_path = ''
+    def to_list(self):
+        return ['demlo'] + self.args.to_list() + [self.input_path]
+    def run(self):
+        cmd = self.to_list()
+        cmd_str = ''
+        for i in cmd:
+            cmd_str += ' '
+            if ' ' in i or '*' in i or '/' in i:
+                cmd_str += "'" + i + "'"
+            else:
+                cmd_str += i
+        print_action("Demlo command:" + cmd_str)
+        if ask_yn('Execute? (Y/n) '):
+            subprocess.call(cmd)
+            return True
+        else:
+            print("Aborting")
+            return False
+
+class DemloArgs(dict):
+    flags = {'-p', '-c', '-debug', '-t', '-color'}
+    once = {'-exist', '-ext', '-cores'}
+    append = {'-pre', '-post'}
+    mult = {'-s', '-r'}
+
+    def add_args(self, arglist):
+        i = 0
+        while i < len(arglist):
+            arg = arglist[i]
+            if arg in DemloArgs.flags:
+                self[arg] = True
+            elif arg in DemloArgs.once:
+                self[arg] = arglist[i+1]
+                i += 1
+            elif arg in DemloArgs.append:
+                if arg in self:
+                    self[arg] += '; ' + arglist[i+1]
+                else:
+                    self[arg] = arglist[i+1]
+                i += 1
+            elif arg in DemloArgs.mult:
+                if arg in self:
+                    self[arg] += arglist[i+1]
+                else:
+                    self[arg] = [arglist[i+1]]
+                i += 1
+            else:
+                print('skipping unrecognized demlo arg: %s' % arg)
+            i += 1
+
+    def to_list(self):
+        out = []
+        for arg_name in self:
+            if arg_name in DemloArgs.flags:
+                out.append(arg_name)
+            elif arg_name in DemloArgs.once.union(DemloArgs.append):
+                out += [arg_name, self[arg_name]]
+            elif arg_name in DemloArgs.mult:
+                for val in self[arg_name]:
+                    out += [arg_name, val]
+        return out
+
+class DemloPlus:
+
+    def __init__(self):
+        # main parser
+        self.main_parser = argparse.ArgumentParser(description="DemloPlus: additional library management functionality")
+        subparsers = self.main_parser.add_subparsers(dest='subparser_name')
+        # query subparser
+        self.query_parser = subparsers.add_parser('query')
+        self.query_parser.add_argument('-e', '--exact', dest='exact_match', action='store_true')
+        self.query_parser.add_argument("target", metavar='TARGET')
+        self.query_parser.set_defaults(func=self.query)
+        # add subparser
+        self.add_parser = subparsers.add_parser('add')
+        add_parser_subparsers = self.add_parser.add_subparsers(dest='add_subparser_name')
+        add_symlink_parser = add_parser_subparsers.add_parser('symlink')
+        add_symlink_parser.add_argument("target", metavar='TARGET')
+        add_demlo_parser = add_parser_subparsers.add_parser('demlo')
+        add_demlo_parser.add_argument("target", metavar='TARGET')
+        add_demlo_parser.add_argument("user_demlo_args", metavar='DEMLO_ARG', nargs=argparse.REMAINDER, default=[])
+        self.add_parser.set_defaults(func=self.add)
+        # sync subparser
+        self.sync_parser = subparsers.add_parser('sync')
+        self.sync_parser.add_argument("library", metavar='LIBRARY', choices=['hi-res', 'lo-res', 'sdcard'])
+        self.sync_parser.add_argument('-e', '--exact', dest='exact_match', action='store_true')
+        self.sync_parser.add_argument('-n', '--no-rebase', dest='no_rebase', action='store_true')
+        self.sync_parser.add_argument("target", metavar='TARGET')
+        self.sync_parser.add_argument("user_demlo_args", metavar='DEMLO_ARG', nargs=argparse.REMAINDER, default=[])
+        self.sync_parser.set_defaults(func=self.sync)
+
+    def query(self, args):
+        info = self.get_info(args)
+        info.print_self()
+        return info
+
+    ###
+    # add new audio to library
+    #
+    def add(self, args):
+        if not args.add_subparser_name:
+            self.add_parser.print_help()
+            exit()
+        print("== ADD ==")
+        args.target = self.get_abspath_from_path(args.target)
+        if args.add_subparser_name == 'symlink':
+            self.add_symlink(args.target)
+        else:
+            self.add_demlo(args.target, args.user_demlo_args)
+
+    def add_symlink(self, target):
+        print("Adding symlink...")
+        abspath = self.get_abspath_from_path(target)
+        # get artist name
+        path_to_audio_file = self.find_audio_file(target)
+        artist_name = self.get_tags_from_file(path_to_audio_file)['artist']
+        if artist_name == None:
+            artist_name = '[no artist]'
+        artist_path = HI_RES_LIBRARY_BASE_PATH + LIBRARY_SYMLINK_PATH + artist_name
+        os.makedirs(artist_path, exist_ok=True) # mkdir -p "$artist_path"
+        basename = os.path.basename(abspath)
+        symlink_path = artist_path + '/' + basename
+        if not os.path.exists(symlink_path):
+            os.symlink(abspath, symlink_path)
+            print_action("Success: created symlink %s -> %s" % (abspath, symlink_path))
+        else:
+            print_action("Error: symlink already exists")
+
+    def add_demlo(self, target, user_demlo_args):
+        print("Adding via demlo...")
+        abspath = self.get_abspath_from_path(target)
+        cmd = DemloCommand()
+        cmd.args.add_args(['-s', '01-hi-res'] + user_demlo_args)
+        cmd.input_path = abspath
+        cmd.run()
+
+    ###
+    # sync library/ies
+    #
+    def sync(self, args):
+        info = self.query(args)
+        print('=== SYNC ===')
+        if args.library == 'hi-res':
+            self.sync_hi_res(info, args.user_demlo_args, args.no_rebase)
+        elif args.library == 'lo-res':
+            self.sync_lo_res(info, args.user_demlo_args, args.no_rebase)
+        elif args.library == 'sdcard':
+            if not (info.status.SYMLINKED_INTO_LO_RES or info.status.DEMLOED_INTO_LO_RES):
+                print("Error: cannot sync target to sdcard unless it has been synced to lo-res library")
+                return
+            self.sync_sdcard(info, args.user_demlo_args)
+
+    def sync_hi_res(self, info, user_demlo_args, no_rebase):
+        print_action('Syncing with hi-res library...')
+        # build and run demlo command(s)
+        default_demlo_args = ['-s', '01-hi-res']
+        # if the input isn't in the MPD database
+        if info.status.DEMLOED_INTO_HI_RES:
+            cmd = DemloCommand()
+            cmd.args.add_args(default_demlo_args + ['-exist', 'inplace'] + user_demlo_args)
+            cmd.input_path = info.paths.hi_res.demlo.__str__()
+            if not cmd.run():
+                return
+        if info.status.SYMLINKED_INTO_HI_RES:
+            cmd = DemloCommand()
+            cmd.args.add_args(default_demlo_args + ['-exist', 'overwrite'] + user_demlo_args) # don't want to remove torrented files
+            cmd.input_path = info.paths.hi_res.symlink.__str__()
+            if not cmd.run():
+                return
+            # remove previously existing symlink
+            symlink_path = cmd.input_path
+            if '-p' in cmd.args:
+                # if it's an album
+                if os.path.islink(symlink_path):
+                    os.unlink(symlink_path)
+                    print_action("Removed symlink: " + symlink_path)
+                    # see if the containing (artist) directory is now empty
+                    artist_directory = os.path.split(symlink_path)[0]
+                    if os.listdir(artist_directory) == []:
+                        os.removedirs(artist_directory)
+                        print_action("Removed empty artist directory: " + artist_directory)
+                # if it's an artist
+                elif os.path.isdir(symlink_path):
+                    os.removedirs(symlink_path)
+                    print_action("Removed directory tree rooted at " + symlink_path)
+                # if it's a track
+                elif os.path.isfile(symlink_path):
+                    print_action("Error: cannot remove symlink of single torrented file; must remove entire album or entire artist")
+                    print("Aborting")
+                    return
+                info.status.SYMLINKED_INTO_HI_RES = False
+            else:
+                print_action('(not removing symlink; use -p to execute)')
+        if '-p' in cmd.args:
+            self.DEMLOED_INTO_HI_RES = True
+        # see if we should sync lo-res library as well
+        if ask_yn('Sync with lo-res library? (Y/n) '):
+            self.sync_lo_res(info, user_demlo_args, no_rebase)
+        else:
+            print('Done')
+
+    def sync_lo_res(self, info, user_demlo_args, no_rebase):
+        print_action('Syncing with lo-res library...')
+        default_demlo_args = ['-s', '02-lo-res']
+        # build and run demlo command(s)
+        if info.status.DEMLOED_INTO_HI_RES:
+            cmd = DemloCommand()
+            if info.status.DEMLOED_INTO_LO_RES:
+                if no_rebase:
+                    cmd.args.add_args(default_demlo_args + ['-exist', 'inplace'] + user_demlo_args)
+                    cmd.input_path = info.paths.lo_res.demlo.__str__()
+                else:
+                    # TODO: remove pre-existing files iff -p is passed
+                    cmd.args.add_args(default_demlo_args + user_demlo_args)
+                    cmd.input_path = info.paths.hi_res.demlo.__str__()
+            else:
+                cmd.args.add_args(default_demlo_args + user_demlo_args)
+                cmd.input_path = info.paths.hi_res.demlo.__str__()
+            if not cmd.run():
+                return
+        if info.status.SYMLINKED_INTO_HI_RES:
+            cmd = DemloCommand()
+            default_demlo_args = ['-s', '02-lo-res', '-pre', 'torrent = true', '-r', 'tag']
+            if info.status.SYMLINKED_INTO_LO_RES:
+                if no_rebase:
+                    cmd.args.add_args(default_demlo_args + user_demlo_args)
+                    cmd.input_path = info.paths.lo_res.symlink.__str__()
+                else:
+                    # TODO: remove pre-existing files iff -p is passed
+                    cmd.args.add_args(default_demlo_args + ['-exist', 'overwrite'] + user_demlo_args)
+                    cmd.input_path = info.paths.hi_res.symlink.__str__()
+            else:
+                cmd.args.add_args(default_demlo_args + user_demlo_args)
+                cmd.input_path = info.paths.hi_res.symlink.__str__()
+            if not cmd.run():
+                return
+        # see if we should sync to sdcard as well
+        if ask_yn('Sync to sdcard? (Y/n) '):
+            self.sync_sdcard(info, user_demlo_args)
+        else:
+            print('Done')
+
+    def sync_sdcard(self, info, user_demlo_args):
+        self.mount_sdcard()
+        print_action("Syncing with sdcard...")
+        if info.status.DEMLOED_INTO_LO_RES:
+            lo_res_path = info.paths.lo_res.demlo.__str__()
+            sdcard_path = info.paths.sdcard.demlo.__str__()
+        else:
+            lo_res_path = info.paths.lo_res.symlink.__str__()
+            sdcard_path = info.paths.sdcard.symlink.__str__()
+        if '-p' in user_demlo_args:
+            copy_cmd = ['rsync', '-v', '-r', '--delete', lo_res_path, os.path.split(sdcard_path)[0]]
+        else:
+            copy_cmd = ['rsync', '--dry-run', '-v', '-r', '--delete', lo_res_path, os.path.split(sdcard_path)[0]]
+        print(' '.join(copy_cmd))
+        if ask_yn('Execute? (Y/n) '):
+            subprocess.call(copy_cmd)
+        if os.path.ismount(SDCARD_MOUNT_PATH):
+            print('Unmounting sdcard...')
+            subprocess.call(['umount', '-v', SDCARD_MOUNT_PATH])
+        print('Done')
+
+    def get_info(self, args):
+        info = Info()
+        info.paths = Paths()
+        # get paths
+        # first parse tag notation
+        query_tags = self.parse_tag_notation(args.target)
+        # then query MPD database
+        try:
+            results = self.search_mpd_database(query_tags, args.exact_match)
+        except MpdQueryException as e:
+            print(e)
+            exit()
+        # now determine get target and target_type
+        if query_tags['title'] != None:
+            info.target = results[0]['title'] + '//' + results[0]['album'] + '::' + results[0]['title']
+            info.target_type = TargetType.TRACK
+        elif query_tags['album'] != None:
+            info.target = results[0]['artist'] + '//' + results[0]['album']
+            info.target_type = TargetType.ALBUM
+        else:
+            info.target = results[0]['artist']
+            info.target_type = TargetType.ARTIST
+        # now we can actually get the paths
+        # first get hi-res paths as splits
+        info.paths.init_hi_res()
+        for result in results:
+            pathsplit = result['file'].split('/')
+            if not info.paths.hi_res.demlo and pathsplit[1] == 'non-torrents':
+                info.paths.hi_res.init_demlo()
+                info.paths.hi_res.demlo.artist = pathsplit[2]
+                if info.target_type is not TargetType.ARTIST:
+                    info.paths.hi_res.demlo.album = pathsplit[3]
+                    if info.target_type is TargetType.TRACK:
+                        info.paths.hi_res.demlo.title = '/'.join(pathsplit[4:])
+            elif not info.paths.hi_res.symlink and pathsplit[1] == 'torrents':
+                info.paths.hi_res.init_symlink()
+                info.paths.hi_res.symlink.artist = pathsplit[2]
+                if info.target_type is not TargetType.ARTIST:
+                    info.paths.hi_res.symlink.album = pathsplit[3]
+                    if info.target_type is TargetType.TRACK:
+                        info.paths.hi_res.symlink.title = '/'.join(pathsplit[4:])
+            if info.paths.hi_res.demlo and info.paths.hi_res.symlink:
+                break
+        # then fill in rest of paths
+        if info.paths.hi_res.symlink and info.target_type is TargetType.ARTIST:
+            info.paths.hi_res.init_demlo()
+            info.paths.hi_res.demlo.copy_from(info.paths.hi_res.symlink, False)
+        info.paths.fill_in_lo_res(info.paths.hi_res)
+        info.paths.fill_in_sdcard(info.paths.lo_res)
+        # now get status based on paths
+        info.status = Status()
+        if info.target_type is TargetType.TRACK:
+            func = os.path.isfile
+        else:
+            func = os.path.isdir
+        info.status.DEMLOED_INTO_HI_RES = func(str(info.paths.hi_res.demlo))
+        info.status.SYMLINKED_INTO_HI_RES = func(str(info.paths.hi_res.symlink))
+        info.status.DEMLOED_INTO_LO_RES = func(str(info.paths.lo_res.demlo))
+        info.status.SYMLINKED_INTO_LO_RES = func(str(info.paths.lo_res.symlink))
+        if os.path.ismount(SDCARD_MOUNT_PATH):
+            info.status.DEMLOED_ONTO_SDCARD = func(str(info.paths.sdcard.demlo))
+            info.status.SYMLINKED_ONTO_SDCARD = func(str(info.paths.sdcard.symlink))
+        return info
+
+    def parse_tag_notation(self, notation):
+        query_tags = {'artist': None, 'album': None, 'title': None}
+        album_start = notation.find('//')
+        title_start = notation.find('::')
+        if album_start == -1 and title_start == -1:
+            first_sep = len(notation)
+            second_sep = len(notation)
+        else:
+            if album_start == -1 or title_start == -1:
+                first_sep = max(album_start, title_start)
+                second_sep = len(notation)
+            else:
+                first_sep = min(album_start, title_start)
+                second_sep = max(album_start, title_start)
+        # get artist
+        if first_sep > 0:
+            query_tags['artist'] = notation[:first_sep]
+        # get next tag
+        if second_sep > first_sep:
+            if notation[first_sep] == '/':
+                query_tags['album'] = notation[first_sep+2:second_sep]
+            else:
+                query_tags['title'] = notation[first_sep+2:second_sep]
+        # get next tag
+        if second_sep < len(notation):
+            query_tags['title'] = notation[second_sep+2:]
+        return query_tags
+
+    def get_abspath_from_path(self, path):
+        abspath = os.path.abspath(path)
+        if not os.path.exists(abspath):
+            print("Error: path '%s' does not exist" % path)
+            exit()
+        return abspath
+
+    def find_audio_file(self, abspath):
+        if os.path.isfile(abspath):
+            return abspath
+        for root, dirs, files in os.walk(abspath, followlinks=True):
+            for f in files:
+                if os.path.splitext(f)[1] in ['.flac', '.mp3', '.m4a']:
+                    return root + '/' + f
+
+    def get_tags_from_file(self, abspath):
+        import taglib
+        song = taglib.File(abspath)
+        tags = {'artist': None, 'album': None, 'title': None}
+        # get artist
+        for tag in ['ALBUMARTIST', 'ARTIST']:
+            if tag in song.tags:
+                tags['artist'] = song.tags[tag][0]
+                break
+        # get album and title
+        if 'ALBUM' in song.tags:
+            tags['album'] = song.tags['ALBUM'][0]
+        if 'TITLE' in song.tags:
+            tags['title'] = song.tags['TITLE'][0]
+        return tags
+
+    def search_mpd_database(self, query_tags, exact_match):
+        client = MPDClient()
+        client.connect('localhost', MPD_PORT)
+        # build query arguments
+        query = []
+        for tag in query_tags:
+            if query_tags[tag] != None:
+                query.append(tag)
+                query.append(query_tags[tag])
+        # get results
+        if exact_match:
+            results = client.find(*query)
+        else:
+            results = client.search(*query)
+        client.close()
+        client.disconnect()
+        if len(results) == 0:
+            raise NoResultsFoundException()
+        # make sure results are unique
+        result_tags = {}
+        for tag in query_tags:
+            result_tags[tag] = None
+        for result in results:
+            for tag in query_tags:
+                if query_tags[tag] != None:
+                    if result_tags[tag] == None and tag in result:
+                        result_tags[tag] = result[tag]
+                    elif tag in result and result[tag] != result_tags[tag]:
+                        raise MultipleResultsFoundException({'tag':tag, 'values':[result[tag], result_tags[tag]]})
+        return results
+
+    def get_hi_res_paths_from_mpd_results(self, results):
+        # get directory path
+        if self.info.target_type is TargetType.TRACK:
+            filepath = results[0]['file']
+        elif self.info.target_type is TargetType.ALBUM:
+            filepath = '/'.join(results[0]['file'].split('/')[:4])
+        else:
+            filepath = '/'.join(results[0]['file'].split('/')[:3])
+        return HI_RES_LIBRARY_BASE_PATH + filepath
+
+    def mount_sdcard(self):
+        if os.path.ismount(SDCARD_MOUNT_PATH):
+            print("sdcard mounted")
+            return True
+        print("sdcard not mounted")
+        if ask_yn("Attempt to mount now? (Y/n) "):
+            subprocess.call(['mount', '-v', SDCARD_MOUNT_PATH])
+        if not os.path.ismount(SDCARD_MOUNT_PATH):
+            print("Aborting")
+            exit()
+
+    def run(self):
+        args = self.main_parser.parse_args()
+        if args.subparser_name:
+            args.func(args)
+        else:
+            self.main_parser.print_help()
+
+if __name__ == '__main__':
+    app = DemloPlus()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        print("\nAborting")
+        exit()
