@@ -1,10 +1,9 @@
 #!/bin/python
 
 # TODO:
-# - artists that are partially symlinked, partially demloed
 # - more configurability for paths, library structure
 
-import sys, os, os.path, subprocess, argparse
+import sys, os, os.path, shutil, subprocess, argparse
 from enum import Enum
 from mpd import MPDClient
 
@@ -42,7 +41,8 @@ class MultipleResultsFoundException(MpdQueryException):
         return self.message
 
 def apply_lo_res_pathsubs(string):
-    lua_code = """local s = "%s"
+    lua_code = """output = {}
+    local s = "%s"
     require "02-lo-res"
     for bad, good in pairs(pathsubs) do
         s = s:gsub(bad, good)
@@ -367,7 +367,8 @@ class DemloPlus:
     # sync library/ies
     #
     def sync(self, args):
-        info = self.query(args)
+        self.args = args
+        info = self.query(self.args)
         print('=== SYNC ===')
         if args.library == 'hi-res':
             self.sync_hi_res(info, args.user_demlo_args, args.no_rebase)
@@ -383,16 +384,15 @@ class DemloPlus:
         print_action('Syncing with hi-res library...')
         # build and run demlo command(s)
         default_demlo_args = ['-s', '01-hi-res']
-        # if the input isn't in the MPD database
         if info.status.DEMLOED_INTO_HI_RES:
             cmd = DemloCommand()
-            cmd.args.add_args(default_demlo_args + ['-exist', 'inplace'] + user_demlo_args)
+            cmd.args.add_args(default_demlo_args + user_demlo_args)
             cmd.input_path = info.paths.hi_res.demlo.__str__()
             if not cmd.run():
                 return
         if info.status.SYMLINKED_INTO_HI_RES:
             cmd = DemloCommand()
-            cmd.args.add_args(default_demlo_args + ['-exist', 'overwrite'] + user_demlo_args) # don't want to remove torrented files
+            cmd.args.add_args(default_demlo_args + ["-post", "output.rmsrc = false"] + user_demlo_args) # don't remove torrented files
             cmd.input_path = info.paths.hi_res.symlink.__str__()
             if not cmd.run():
                 return
@@ -410,20 +410,20 @@ class DemloPlus:
                         print_action("Removed empty artist directory: " + artist_directory)
                 # if it's an artist
                 elif os.path.isdir(symlink_path):
-                    os.removedirs(symlink_path)
+                    shutil.rmtree(symlink_path)
                     print_action("Removed directory tree rooted at " + symlink_path)
                 # if it's a track
                 elif os.path.isfile(symlink_path):
                     print_action("Error: cannot remove symlink of single torrented file; must remove entire album or entire artist")
                     print("Aborting")
                     return
-                info.status.SYMLINKED_INTO_HI_RES = False
             else:
                 print_action('(not removing symlink; use -p to execute)')
-        if '-p' in cmd.args:
-            self.DEMLOED_INTO_HI_RES = True
         # see if we should sync lo-res library as well
         if ask_yn('Sync with lo-res library? (Y/n) '):
+            print("lo-res path: " + info.paths.lo_res.symlink.__str__())
+            info = self.get_info(self.args)
+            # TODO: extract index from demlo, modify it for use on lo-res files (to avoid unnecessary reencoding)
             self.sync_lo_res(info, user_demlo_args, no_rebase)
         else:
             print('Done')
